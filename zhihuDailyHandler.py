@@ -2,14 +2,15 @@ from __future__ import print_function
 from datetime import datetime
 from HTMLParser import HTMLParser
 import boto3
+from boto3.session import Session
 import requests
 
 TTS_ENDPOINT = 'http://tsn.baidu.com/text2audio'
 TTS_TOKEN = '25.f1aac8feab2f71f330bb597556de0997.315360000.1799467929.282335-9190441'
-TTS_HEADER = 'Content-Type: audio/mp3'
+TTS_HEADER = {'Content-Type': 'audio/mp3'}
 TTS_CHUNK_SIZE = 333
 
-S3_ENDPOINT = 'http://zhihu.s3.amazonaws.com/'
+S3_ENDPOINT = 'https://zhihu.s3.amazonaws.com/'
 PRE_NEWS = 'support/pre_news_'
 
 NEWS_ENDPOINT = 'http://news-at.zhihu.com/api/4/news/latest'
@@ -27,16 +28,17 @@ ST_LIST_NEWS = 'ST_LIST_NEWS'
 TOKEN_DELIMITER = '|'
 
 INDEX_DIC = {
-    'first': 1,
+    '1st': 1,
+    '2nd': 2,
     'second': 2,
-    'third': 3,
-    'fourth': 4,
-    'fifth': 5,
-    'sixth': 6,
-    'seventh': 7,
-    'eighth': 8,
-    'ninth': 9,
-    'tenth': 10
+    '3rd': 3,
+    '4th': 4,
+    '5th': 5,
+    '6th': 6,
+    '7th': 7,
+    '8th': 8,
+    '9th': 9,
+    '10th': 10
 }
 
 class MLStripper(HTMLParser):
@@ -51,7 +53,6 @@ class MLStripper(HTMLParser):
 # ----------------Global variables----------------------------------------------
 news_title_list = []
 read_news_list = []
-latest_news_list = {}
 paused_token = None
 current_news_index = 0
 
@@ -116,7 +117,7 @@ def build_response(response):
 def get_tts_content(tex):
     options = {
         'lan': 'zh',
-        'ctp': 1,
+        'ctp': '1',
         'cuid': 'zhihuDaily_alexa',
         'tex': tex,
         'tok': TTS_TOKEN
@@ -126,65 +127,98 @@ def get_tts_content(tex):
         return response.content
     return None
 
+def get_s3_session():
+    return  Session(
+        aws_access_key_id='AKIAJJ5Y3AQT44XX5OAQ',
+        aws_secret_access_key='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',
+        region_name='us-east-1'
+    )
+    
 def put_to_s3(key, content):
-    s3 = boto3.resource('s3')
+    session = get_s3_session()
+    s3 = session.resource('s3')
     s3.Object('zhihu', key).put(Body=content, ACL='public-read')
     return S3_ENDPOINT + key
 
 def get_dir_in_s3(dir_key):
-    s3 = boto3.resource('s3')
+    session = get_s3_session()
+    s3 = session.resource('s3')
     bucket = s3.Bucket('zhihu')
     file_list = bucket.objects.filter(Marker=dir_key, Prefix=dir_key)
     key_list = [x.key for x in file_list if x.key != str(dir_key + '/')]
     key_list.sort()
     if len(key_list) == 0:
         return None
-    [current_story_id, _] = key_list[0].split('/')
+    [_, current_story_id, _] = key_list[0].split('/')
     current_story = []
     story_list = []
     for i in range(0, len(key_list)):
-        [story_id, key] = key_list[i].split('/')
+        [_, story_id, key] = key_list[i].split('/')
         if story_id != current_story_id:
-            current_story = [current_story[len(current_story) - 1]] + current_story
-            current_story = current_story[0: len(current_story) - 1]
-            story_list.append(current_story)
+            story_list.append(get_sorted_story_audio_s3(current_story))
             current_story = []
+            current_story_id = story_id
         if key != '':
-            current_story.append(S3_ENDPOINT + dir_key + '/' + key_list[i])
+            current_story.append(S3_ENDPOINT + str(key_list[i]))
+    story_list.append(get_sorted_story_audio_s3(current_story))
+    print('in story list')
+    print(str(story_list))
     return story_list
+
+def get_sorted_story_audio_s3(current_story):
+    current_story = [current_story[len(current_story) - 1]] + current_story
+    return current_story[0: len(current_story) - 1]
 
 def put_story_to_s3(date, story):
     audios = get_news_audio(story)
     parent_dir = date + '/' + story['id']
     audio_urls = [put_to_s3(parent_dir + '/title.mp3', audios[0])]
-    audio_urls.extend(map(lambda (i, x): put_to_s3(parent_dir + '/' + i + '.mp3', x), enumerate(audios[1:])))
+    audio_urls.extend([put_to_s3(parent_dir + '/' + str(i) + '.mp3', x) for (i, x) in enumerate(audios[1:])])
     return audio_urls
+
+def put_story_list_to_s3(date, story_list):
+    news = get_formated_news(date, story_list)
+    return [put_story_to_s3(date, x) for x in news['stories']]
 
 def get_news_audio(story):
     content = [story['title']]
     content.extend(story['chunked_content'])
     # assuming no None is returned
-    return map(lamda x: get_tts_content(x), content)
+    return [get_tts_content(x) for x in content]
+
+def get_story_id_from_s3(news_list):
+    story_id_list = []
+    for i in range(0, len(news_list)):
+        story_id = news_list[i][0].split('/')[4]
+        story_id_list.append(story_id)
+    return story_id_list
 
 def load_latest_news():
     latest_date = datetime.now().strftime('%Y%m%d')
-    if latest_date in latest_news_list:
-        return latest_news_list[latest_date]
+    # use dynamodb to do cache
     news_list = get_dir_in_s3(latest_date)
-    if news_list is not None:
-        global latest_news_list
-        latest_news_list[latest_date] = news_list
-        return news_list
     raw_news = get_latest_news()
-    if raw_news is not None and raw_news['date'] != latest_date:
-        return None
-    news = get_formated_news()
-    if news is None:
-        return None
-    date = news['date']
-    global latest_news_list
-    latest_news_list[date] = map(lambda x: put_story_to_s3(date, x), news['stories'])
-    return latest_news_list[date]
+    latest_story_id_list = []
+    date = None
+    if raw_news is not None:
+        date = raw_news['date']
+        latest_story_id_list = [str(x['id']) for x in raw_news['stories']]
+    if date != latest_date:
+        return []
+    if news_list is not None:
+        story_id_list = get_story_id_from_s3(news_list)
+        new_story_id_list = list(set(latest_story_id_list) - set(story_id_list))
+    else:
+        news_list = []
+        new_story_id_list = latest_story_id_list
+    print('new_story_to_store')
+    print(str(new_story_id_list))
+    new_story_list = put_story_list_to_s3(date, new_story_id_list)
+    # read the newly added story since last call
+    news_list.extend(new_story_list)
+    print('list news')
+    print(str(news_list))
+    return news_list
 
 def get_latest_news():
     response = requests.get(NEWS_ENDPOINT, headers=ZHIHU_HEADER)
@@ -192,15 +226,11 @@ def get_latest_news():
         return response.json()
     return None
 
-def get_formated_news():
-    news = get_latest_news()
-    if news:
-        story_ids = map(lambda x: x['id'], news['stories'])
-        return {
-            'date': news['date'],
-            'stories': map(lambda id: get_formated_story(id), story_ids)
-        }
-    return None
+def get_formated_news(date, story_ids):
+    return {
+        'date': date,
+        'stories': [get_formated_story(id) for id in story_ids]
+    }
 
 def get_story(story_id):
     response = requests.get(STORY_ENDPOINT + story_id, headers=ZHIHU_HEADER)
@@ -232,16 +262,17 @@ def get_chunked_story(content):
 # --------------- Functions that control the skill's behavior ------------------
 def list_news(intent):
     news = load_latest_news()
-    if news is None:
+    if len(news) == 0:
         return build_response(build_speechlet_response('We encountered an error when trying to load latest news, please try later', 'Error', None))
-    titles = map(lambda x: x[0], news)
+    titles = [x[0] for x in news]
     list_news_content = []
-    for i in range(i, len(news)):
+    for i in range(0, len(news)):
         list_news_content.append(S3_ENDPOINT + PRE_NEWS + str(i + 1) + '.mp3')
         list_news_content.append(titles[i])
     list_news_content.append(S3_ENDPOINT + 'support/post_list.mp3')
     global news_title_list
     news_title_list = list_news_content
+    print(str(list_news_content))
     return build_response(build_audio_play_response(
             'AudioPlayer.Play', 'REPLACE_ALL', ST_LIST_NEWS + '|1', news_title_list[0], 0))
 
@@ -249,14 +280,15 @@ def read_nth_news(intent):
     if 'Index' in intent['slots']:
         index = intent['slots']['Index']['value']
     if index:
-        return read_news(INDEX_DIC[index] - 1], intent)
+        print('read ' + str(index))
+        return read_news(INDEX_DIC[str(index)] - 1, intent)
 
 def read_news(index, intent):
     news = load_latest_news()
-    if news is None:
+    if len(news) == 0:
         return build_response(build_speechlet_response('We encountered an error when trying to read the news, please try later', 'Error', None))
-    if index >= len(news)
-        return build_response(build_speechlet_response('There are total ' + len(news) + 'news. Can not read ' + str(index + 1) + 'th news.', 'Error', None))
+    if index >= len(news):
+        return build_response(build_speechlet_response('There are total ' + str(len(news)) + 'news. Can not read ' + str(index + 1) + 'th news.', 'Error', None))
     global current_news_index
     current_news_index = index
     news_to_read = news[index]
@@ -272,7 +304,7 @@ def read_news(index, intent):
     return build_response(build_audio_play_response(
         'AudioPlayer.Play', 'REPLACE_ALL', ST_READ_NEWS + '|1', read_news_list[0], 0))
 
-def set_paused_song(audio_request):
+def set_paused_audio(audio_request):
     global paused_token
     paused_token = audio_request['token']
     global paused_offset
@@ -281,13 +313,14 @@ def set_paused_song(audio_request):
 
 def handle_audio_nearly_finish(token):
     [state, index] = token.split(TOKEN_DELIMITER)
+    index = int(index)
     next_token = state + '|' + str(index + 1)
     next_audio = None
-    if state == ST_LIST_NEWS && len(news_title_list) > 0:
+    if state == ST_LIST_NEWS and len(news_title_list) > 0:
         if index ==len(news_title_list):
             return build_audio_stop_response()
         next_audio = news_title_list[index]
-    elif state == ST_READ_NEWS && len(read_news_list) > 0:
+    elif state == ST_READ_NEWS and len(read_news_list) > 0:
         if index ==len(read_news_list):
             return build_audio_stop_response()
         next_audio = read_news_list[index]
@@ -303,6 +336,7 @@ def resume(resume_request):
     if paused_token:
         print('---pause token: ' + paused_token + ' pause offset: ' + str(paused_offset) + '---')
         [state, index] = paused_token.split(TOKEN_DELIMITER)
+        index = int(index)
         audio = None
         if state == ST_LIST_NEWS:
             audio = news_title_list[index - 1]
@@ -314,8 +348,8 @@ def resume(resume_request):
         return read_news(0, resume_request)
 
 def skip(skip_request):
+    global current_news_index
     if current_news_index < len(read_news_list):
-        global current_news_index
         current_news_index = current_news_index + 1
         return read_news(current_news_index, skip_request)
     else:
@@ -352,7 +386,7 @@ def on_intent(intent_request):
     print("on_intent requestId=" + intent_request['requestId'])
     intent = intent_request['intent']
     intent_name = intent_request['intent']['name']
-    print("Intent nam=" + intent_name)
+    print("Intent name=" + intent_name)
     # Dispatch to your skill's intent handlers
     if intent_name == "ListNewsIntent":
         return list_news(intent)
@@ -360,7 +394,7 @@ def on_intent(intent_request):
         return read_nth_news(intent)
     elif intent_name == "ReadNewsIntent":
         return read_news(0, intent)
-    elif  if intent_name == "AMAZON.PauseIntent":
+    elif intent_name == "AMAZON.PauseIntent":
         return pause()
     elif intent_name == "AMAZON.ResumeIntent":
         return resume(intent)
