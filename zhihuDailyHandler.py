@@ -127,7 +127,7 @@ def get_tts_content(tex):
         return response.content
     return None
 
-def get_s3_session():
+def get_boto3_session():
     return  Session(
         aws_access_key_id='AKIAJJ5Y3AQT44XX5OAQ',
         aws_secret_access_key='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',
@@ -135,39 +135,52 @@ def get_s3_session():
     )
     
 def put_to_s3(key, content):
-    session = get_s3_session()
+    session = get_boto3_session()
     s3 = session.resource('s3')
     s3.Object('zhihu', key).put(Body=content, ACL='public-read')
     return S3_ENDPOINT + key
-
+    
+def compare_title_s3(item1, item2):
+    [date1, story1, title1] = item1.split('/')
+    [date2, story2, title2] = item2.split('/')
+    date_compare = int(date1) - int(date2)
+    if date_compare != 0:
+        return date_compare
+    story_compare = int(story1) - int(story2)
+    if story_compare != 0:
+        return story_compare
+    [index1, _] = title1.split('.')
+    [index2, _] = title2.split('.')
+    if index1 == 'title':
+        return -1
+    if index2 == 'title':
+        return 1
+    return int(index1) - int(index2)
+    
 def get_dir_in_s3(dir_key):
-    session = get_s3_session()
+    session = get_boto3_session()
     s3 = session.resource('s3')
     bucket = s3.Bucket('zhihu')
     file_list = bucket.objects.filter(Marker=dir_key, Prefix=dir_key)
     key_list = [x.key for x in file_list if x.key != str(dir_key + '/')]
-    key_list.sort()
     if len(key_list) == 0:
         return None
+    key_list.sort(compare_title_s3)
     [_, current_story_id, _] = key_list[0].split('/')
     current_story = []
     story_list = []
     for i in range(0, len(key_list)):
         [_, story_id, key] = key_list[i].split('/')
         if story_id != current_story_id:
-            story_list.append(get_sorted_story_audio_s3(current_story))
+            story_list.append(current_story)
             current_story = []
             current_story_id = story_id
         if key != '':
             current_story.append(S3_ENDPOINT + str(key_list[i]))
-    story_list.append(get_sorted_story_audio_s3(current_story))
+    story_list.append(current_story)
     print('in story list')
     print(str(story_list))
     return story_list
-
-def get_sorted_story_audio_s3(current_story):
-    current_story = [current_story[len(current_story) - 1]] + current_story
-    return current_story[0: len(current_story) - 1]
 
 def put_story_to_s3(date, story):
     audios = get_news_audio(story)
@@ -193,9 +206,61 @@ def get_story_id_from_s3(news_list):
         story_id_list.append(story_id)
     return story_id_list
 
+def get_storys_from_dynamodb(date):
+    session = get_boto3_session()
+    dynamodb = session.resource('dynamodb')
+    table = dynamodb.Table('zhihu')
+    response = table.get_item(Key={'date': date})
+    return response['Item'] if 'Item' in response else []
+
+def put_storys_to_dynamodb(date, story_ids, story_list):
+    session = get_boto3_session()
+    dynamodb = session.resource('dynamodb')
+    table = dynamodb.Table('zhihu')
+    table.put_item(Item={'date': date, 'story_ids': story_ids, 'story_list': story_list})
+
+def sync_story_to_s3_dynamodb(date, new_story_id_list, cached_story_id_list, cached_story_list):
+    news = get_formated_news(date, new_story_id_list)
+    new_story = news['stories']
+    print('enter')
+    for i in range(0, len(new_story)):
+        story = new_story[i]
+        story_id = new_story_id_list[i]
+        story_list = put_story_to_s3(date, story)
+        cached_story_id_list.append(story_id)
+        cached_story_list.append(story_list)
+        put_storys_to_dynamodb(date, cached_story_id_list, cached_story_list)
+        print('synced ' + str(story_id))
+    print('end')
+
+def load_latest_news_1():
+    latest_date = datetime.now().strftime('%Y%m%d')
+    return get_storys_from_dynamodb(latest_date)
+
+def store_latest_news(a, b):
+    raw_news = get_latest_news()
+    latest_story_id_list = []
+    date = None
+    if raw_news is not None:
+        date = raw_news['date']
+        latest_story_id_list = [str(x['id']) for x in raw_news['stories']]
+    if date is None:
+        return
+    cached_storys = get_storys_from_dynamodb(date)
+    cached_story_ids = []
+    cached_news_list = []
+    if len(cached_storys) > 0:
+        cached_story_ids = cached_storys['story_ids']
+        cached_news_list = cached_storys['story_list']
+    new_story_id_list = list(set(latest_story_id_list) - set(cached_story_ids))
+    print('new_story_id_list')
+    print(str(new_story_id_list))
+    #a=get_dir_in_s3(date)
+    #print(str(get_story_id_from_s3(a)))
+    sync_story_to_s3_dynamodb(date, new_story_id_list, cached_story_ids, cached_news_list)
+
 def load_latest_news():
     latest_date = datetime.now().strftime('%Y%m%d')
-    # use dynamodb to do cache
     news_list = get_dir_in_s3(latest_date)
     raw_news = get_latest_news()
     latest_story_id_list = []
